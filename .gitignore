@@ -1,0 +1,10 @@
+# Ignore everything in the repository
+*
+
+#Whitelist the .gitignore file itself so changes to it are tracked
+!.gitignore
+
+# Whitelist your select files
+!lsst_coadd_bulkMP.py
+!map_tractpatch.ipynb
+!coadd_cutout.ipynb
