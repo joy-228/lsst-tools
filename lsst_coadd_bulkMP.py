@@ -1,11 +1,12 @@
-# %%
 '''
-For the Rubin Science Platform at data.lsst.cloud.
+Code developed to create deep_coadd cutouts in bulk for a sample of galaxies. 
+The code queries the TAP service to retrieve patch information, matches galaxy positions to tracts and patches, 
+loads coadd images, and generates cutouts for each source in the specified bands. 
+The cutouts are saved as .npy files for further analysis.
 Data Release: Data Preview 2
 Container Size: large
 
-Originally developed by Andrés A. Plazas Malagón and the Rubin Community Science team with input from Nate Lust for DP1.
-Newer code developed for DP2 with input from Yusra AlSayyad, Jim Bosch, and the Rubin Community Science team.
+Author: Joy Bhattacharyya with inputs from Yusra AlSayyad, Jim Bosch, and the Rubin Community Science team.
 Learning objective: Create a deep_coadd cutouts in bulk.
 '''
 
@@ -34,10 +35,10 @@ assert service is not None
 
 skymap = butler.get("skyMap") #Define the skymap.
 username = os.environ.get('USER')
-cutout_dir = '/home' / username / f'lsst_science/cutouts'
+cutout_dir = '/home/' + username + f'/lsst_science/cutouts_cosmos/'
 print(cutout_dir)
 
-bands = {'u':mcm.magma,'g':mcm.cividis,'r':mcm.viridis,'i':mcm.inferno,'z':mcm.Greys_r}
+bands = {'g':mcm.cividis,'r':mcm.viridis,'i':mcm.inferno,'z':mcm.Greys_r}
 npix = 144
 box_size_deg = 0.5 * npix * 0.2 / 3600  # Define a box of half-width 0.5*npix around the target, then search for all patches within twice that size (2 * `box_size_deg`).
 
@@ -124,12 +125,13 @@ def cutout_over_patch(ll, inpatch, coadd_get, variance_required=False):
     '''
     for ii, src in inpatch.iterrows():
         point = SkyCoord(ra=src['ra']*u.degree,dec=src['dec']*u.degree, frame='icrs')
-        filename = cutout_dir / f'cutout_{src["objid"]}.npy'
+        filename = cutout_dir + f'cutout_{src["objid"]}.npy'
 
+        flag = False
         try: small_bbox = coadd_get['g'].bbox_from_sky_circle(point, box_size_deg*u.degree, clip=False)
-        except: continue
+        except: flag = True
 
-        print(ii)
+        print(ii,', objid:',src["objid"])
 
         #fig,ax=plt.subplots(1,3,figsize=(30,8))
 
@@ -138,7 +140,9 @@ def cutout_over_patch(ll, inpatch, coadd_get, variance_required=False):
         for jj,filt in enumerate(bands):
             
                 try: coadds[filt] = coadd_get[filt][small_bbox] 
-                except: break
+                except: 
+                    flag = True
+                    break
 
                 if variance_required: 
                     img_array.append([coadds[filt].image.array,coadds[filt].variance.array])
@@ -150,22 +154,27 @@ def cutout_over_patch(ll, inpatch, coadd_get, variance_required=False):
                 #del m,s
         #plt.show()
 
-        np.save(filename, np.array(img_array))
+        if not flag: np.save(filename, np.array(img_array))
+        elif flag: print('Cutout failed for objid:',src["objid"])
         del coadds, img_array, small_bbox
 
-def loop_over_patches(ll, up, sample, patches_table, variance_required=False):
-    # For each unique patch, retrieve the corresponding coadd data, and generate cutouts for each source in that patch.
+def loop_over_patches(ll, up, sample,  variance_required=False):
+    '''
+    Loop over each unique patch and generate cutouts for all sources within that patch.
+    '''
+    inpatch = sample[(sample['tract']==up['tract'])&(sample['patch']==up['patch'])]    
+    print(ll, 'tract number:', up['tract'],'patch number:', up['patch'],'patch sources:', inpatch.shape[0])
 
-    inpatch = sample[(sample['tract']==up['tract'])&(sample['patch']==up['patch'])]
-      
-    tp_link = patches_table[(patches_table['lsst_tract']==up['tract'])&(patches_table['lsst_patch']==up['patch'])]
-    s_ra,s_dec = (tp_link['s_ra'].values)[0],(tp_link['s_dec'].values)[0]
-    print(ll, s_ra, s_dec, 'tract number:', up['tract'],'patch number:', up['patch'])
-
-    coadd_get = load_bigcoadd(s_ra, s_dec)
-    cutout_over_patch(ll, inpatch, coadd_get, variance_required=variance_required)
-
-    del inpatch, coadd_get, did_get, tp_link
+    # If there are sources in the patch, load the coadd data and generate cutouts for each source.
+    if not inpatch.empty:
+        
+        coadd_get = load_bigcoadd(up['s_ra'], up['s_dec'])
+        print('Patch coadd loaded')
+        
+        cutout_over_patch(ll, inpatch, coadd_get, variance_required=variance_required)
+        print('Patch sources cutout saved')
+    
+        del inpatch, coadd_get
     
 if __name__ == '__main__':
     """
@@ -173,17 +182,19 @@ if __name__ == '__main__':
     """
 
     # Load the sample of galaxies from a CSV file containing their coordinates and pre-determined patch and tract information.
-    samplefile = 'v1sdwarf_list.csv'
+    samplefile = 'cosmos_search.csv'
     sample = pd.read_csv(samplefile, dtype={'objid': str})
     #print('Shape of sample dataframe:',sample0.shape)
-    #sample = sample0.sample(n=5000, random_state=5)
+    #sample = sample0.sample(n=500, random_state=5)
     #print(sample.shape)
+    assert 'ra' in sample.columns and 'dec' in sample.columns, "Sample must contain 'ra' and 'dec' columns."
 
      # Check if the patches_table.csv file exists; if not, query the TAP service to create it.
     if os.path.exists('patches_table.csv'):
             patches_table = pd.read_csv('patches_table.csv')
     else:
             patches_table = query_atlas()
+            patches_table = patches_table.rename(columns={'lsst_patch': 'patch','lsst_tract': 'tract'})
             patches_table.to_csv('patches_table.csv', index=False)
 
     # Check if the 'patch' column exists in the sample dataframe; if not, compute the corresponding tract and patch for each galaxy using the skymap.
@@ -194,18 +205,24 @@ if __name__ == '__main__':
 
         del tp
 
+    # Identify existing cutouts in the output directory to avoid redundant processing. Only process galaxies that do not already have cutouts saved.
     existings = [re.search(r'\d+',f).group() for f in os.listdir(cutout_dir) if os.path.isfile(os.path.join(cutout_dir, f))]
-    sources = (sample[sample['objid'].isin(existings)].drop_duplicates(subset='objid', keep='first')).reset_index(drop=True)
-    print(len(existings), sources.shape)
-    
-    # Select unique patches from the tract to avoid redundant processing.
-    unique_patch = pd.concat([sources['patch'],sources['tract']]).unique()
-    print(unique_patch)
-    print('No. of unique patches:',len(unique_patch))
+    sources = (sample[~sample['objid'].isin(existings)]).reset_index(drop=True)
+    print('Exisiting cutouts in directory:',len(existings),'Cutouts to be extracted:', sources.shape[0])
 
-    patch_input = [(ll,up) for ll,up in enumerate(unique_patch)]
-    run_wrapper = partial(loop_over_patch, sample=sources, patches_table=patches_table, variance_required=False)
+    # Select unique patches from the tract table.
+    unique_tp = sample[['patch', 'tract']].drop_duplicates()
+    unique_tp_table = unique_tp.merge(patches_table,how='left',on=['tract','patch'])
+    print('No. of unique patches:',unique_tp_table.shape[0])
 
-    with multiprocessing.Pool(4) as pool:
+    del unique_tp, patches_table
+
+    # Prepare the input for multiprocessing: create a list of tuples containing the index and corresponding patch information for each unique patch.
+    patch_input = [(ll,up) for ll,up in unique_tp_table.iterrows()]
+
+    # Use multiprocessing to process each patch in parallel, generating cutouts for all sources within each patch. The `loop_over_patches` function is called for each patch, and the results are saved as .npy files in the specified output directory.
+    run_wrapper = partial(loop_over_patches, sample=sources,  variance_required=False)
+
+    with multiprocessing.Pool(2) as pool:
 
         pool.starmap(run_wrapper, patch_input)
