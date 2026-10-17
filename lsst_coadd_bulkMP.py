@@ -1,15 +1,15 @@
 # %%
 '''
 For the Rubin Science Platform at data.lsst.cloud.
-Data Release: Data Preview 1
+Data Release: Data Preview 2
 Container Size: large
 
-Originally developed by Andrés A. Plazas Malagón and the Rubin Community Science team with input from Nate Lust. 
-Learning objective: Create a large custom `deep_coadd` cutout.
-#Packages: `lsst.daf.butler`, `lsst.ip.diffim.GetTemplateTask`.
+Originally developed by Andrés A. Plazas Malagón and the Rubin Community Science team with input from Nate Lust for DP1.
+Newer code developed for DP2 with input from Yusra AlSayyad, Jim Bosch, and the Rubin Community Science team.
+Learning objective: Create a deep_coadd cutouts in bulk.
 '''
 
-import os
+import os, re 
 import multiprocessing
 from functools import partial
 import numpy as np
@@ -21,103 +21,73 @@ import astropy.wcs as wcs
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 
-from lsst.rsp import get_tap_service
+from lsst.rsp import RSPDiscovery
 from lsst.daf.butler import Butler
-import lsst.afw.display as afwDisplay
-from lsst.geom import Box2I, Point2I, SpherePoint, degrees, Point2D
-from lsst.sphgeom import Box as SphBox
-from lsst.ip.diffim import GetTemplateTask
-from lsst.pipe.tasks.makeDiscreteSkyMap import MakeDiscreteSkyMapTask
+import lsst.geom as geom
 
-butler = Butler("dp1", collections="LSSTComCam/DP1") #Instantiate the butler.
+butler = Butler("dp2", collections="dp2") #Instantiate the butler.
 assert butler is not None
 
-service = get_tap_service("tap")
+discovery = RSPDiscovery("dp2")
+service = discovery.get_tap_client()
 assert service is not None
 
 skymap = butler.get("skyMap") #Define the skymap.
 username = os.environ.get('USER')
+cutout_dir = '/home' / username / f'lsst_science/cutouts'
+print(cutout_dir)
+
 bands = {'u':mcm.magma,'g':mcm.cividis,'r':mcm.viridis,'i':mcm.inferno,'z':mcm.Greys_r}
-box_size_deg = 0.004 #Define a box size of 0.1 degrees around the BCG, then search for all patches within twice that size (2 * `box_size_deg`).
+npix = 144
+box_size_deg = 0.5 * npix * 0.2 / 3600  # Define a box of half-width 0.5*npix around the target, then search for all patches within twice that size (2 * `box_size_deg`).
 
-def gen_smallbox(new_wcs,ra,dec):
-    '''
-    Generate a small bounding box around the given location in pixel coordinates using the WCS of the coadd image.
-
-    Parameters:
-    ----------
-
-    new_wcs: WCS object of the coadd image.
-
-    ra: Right Ascension of the object in degrees.
-
-    dec: Declination of the object in degrees.
+def query_atlas():
+    """
+    Query the TAP service to retrieve the necessary information about the relevant patches.
 
     Returns:
     -------
+    atlas: A pandas DataFrame containing the patch information.
+    """
+    # Query the TAP service to retrieve the necessary information about the relevant patches.
+    query = """SELECT lsst_patch, lsst_tract, s_dec, s_ra, s_region FROM dp2.CoaddPatches"""
+    job = service.submit_job(query)
+    job.run()
+    job.wait(phases=['COMPLETED', 'ERROR'])
+    print('Job phase is', job.phase)
+    if job.phase == 'ERROR':
+        job.raise_if_error()
+    assert job.phase == 'COMPLETED'
 
-    Box2I: A bounding box in pixel coordinates around the object location.
-    '''
-    return  Box2I(
-        Point2I(new_wcs.skyToPixel(SpherePoint(ra - box_size_deg,
-                                               dec - box_size_deg, degrees))),
-        Point2I(new_wcs.skyToPixel(SpherePoint(ra + box_size_deg,
-                                               dec + box_size_deg, degrees))),
-        )     
+    atlas = service.search(query).to_table().to_pandas()
+    job.delete()
+    del query
+    
+    return atlas
 
-def gen_wcsbox(pos_cont,point):
-    '''
-    Generate a new WCS and bounding box for the given position container and point.
+def match_tractpatch(pos):
+    """
+    Match the given positions to the corresponding tracts and patches in the skymap.
 
     Parameters:
     ----------
-    pos_cont: A list containing the WCS and bounding box of the coadd image.
-
-    point: A SpherePoint object representing the location of the object in the sky.
+    pos: A list of `SpherePoint` objects representing the positions to match.
 
     Returns:
     -------
-    new_wcs: The new WCS object for the coadd image.
-
-    small_box: A bounding box in pixel coordinates around the object location.
-    '''
-    cd_wcs = pos_cont[0][0]
-    discrete_skymap_config = MakeDiscreteSkyMapTask().ConfigClass() #Make a skymap that contains all input data.
-    discrete_skymap_config.skyMap.pixelScale = cd_wcs.getPixelScale(Point2D(point)).asArcseconds() #Set the plate scale at the BCG location in the new skymap.
-    discrete_skymap_config.skyMap.projection = 'TAN' #Set the WCS projection type. The WCS of `deep_coadd` images are `TAN` projections([see the DP1 documentation]
-
-    new_skymap = MakeDiscreteSkyMapTask(config=discrete_skymap_config).run(pos_cont).skyMap #Compute the new skymap.
-    new_wcs = new_skymap[0].wcs     #Get the new WCS from the single tract discrete skymap.
-    small_box = gen_smallbox(new_wcs,(point.getRa()).asDegrees(),(point.getDec()).asDegrees())
-
-    return new_wcs,small_box
-    
-
-def reconstitute_fits(uname,ra,dec,objid,ll):
-    img_arr = [[],[],[]]
-    
-    for ii, key in enumerate(bands):    
-            fnm = '/home/' + uname + '/lsst_science/cutouts/temp_{}{}.fits'.format(key,ll)
-            hdul = fits.open(fnm)
-            w = wcs.WCS(hdul[0].header)
-            pos_coord = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
-            wc = [int(i) for i in w.world_to_pixel(pos_coord)]
-            if ii==0:    img_hdr = [hdul[j].header for j in range(1,4)]
-            for j in range(3): img_arr[j].append((hdul[j+1].data)[wc[1]-64:wc[1]+64,wc[0]-64:wc[0]+64])
+    A numpy array containing the matched tract and patch indices for each position.
+    """
+    tp = []
+    for ii, p in pos.iterrows():
+        point = geom.SpherePoint(p['ra'] * geom.degrees, p['dec'] * geom.degrees)
+        tract = skymap.findTract(point)
+        patch = tract.findPatch(point)
         
-            hdul.close()
-            os.remove(fnm)
-    #fnm = '/home/' + uname + '/lsst_science/cutouts/cutout_{:.6f}_{:.6f}.fits'.format(ra,dec)
-    #fits.writeto(fnm, np.array(img_arr[0]), header=img_hdr[0],overwrite=True)
-    #for j in [1,2]: fits.append(fnm, np.array(img_arr[j]), img_hdr[j]) 
-
-    fnm = '/home/' + uname + f'/lsst_science/cutouts/cutout_{int(objid)}.npy'
-    data_uint8 = np.array(img_arr[0])
-
-    np.save(fnm, data_uint8)
+        tp.append((tract.tract_id, patch.getSequentialIndex()))
+    return np.array(tp)
 
 
-def get_coadd_basics(s_ra, s_dec):
+def load_bigcoadd(s_ra, s_dec):
     '''
     Retrieve the coadd images and their corresponding data IDs for each filter band at the specified sky coordinates.
 
@@ -132,78 +102,70 @@ def get_coadd_basics(s_ra, s_dec):
 
     coadd_get: A dictionary containing the coadd images for each filter band.
 
-    did_get: A dictionary containing the data IDs for each filter band.
-
-    position_container: A list containing the WCS and bounding box of the coadd image for the 'g' band.
     '''
-    coadd_get,did_get = {},{}
+    coadd_get = {}
     for jj,filt in enumerate(bands):
-            query = f"patch.region OVERLAPS POINT({s_ra}, {s_dec}) and band in ('{filt}')"
-            try:
-                qry_ds = butler.query_datasets("deep_coadd",where=query)
-            except: continue                     
-            #band_container = sorted_data.setdefault(did["band"], list())
-            #band_container.append()
+                query = f"patch.region OVERLAPS POINT({s_ra}, {s_dec}) and band in ('{filt}')"
         
-            did_get[filt] = qry_ds[0].dataId
-            coadd_get[filt] = butler.get(qry_ds[0])
+                try: qry_ds = butler.query_datasets("deep_coadd", where=query,)
+                except: continue
+        
+                #did_get[filt] = qry_ds[0].dataId
+                coadd_get[filt] =  butler.get(qry_ds[0])
 
-            patchInfo = skymap[did_get[filt]["tract"]][did_get[filt]["patch"]]
-            if filt=='g': position_container = [(patchInfo.wcs, patchInfo.outer_bbox)]
-    return coadd_get,did_get,position_container
+    return coadd_get
 
-
-def get_coadd_cutouts(ll, inpatch, coadd_get, did_get, position_container):
-    for ii, source in inpatch.iterrows():
-        ra,dec = source['ra'], source['dec']
-        point = SpherePoint(ra * degrees,dec * degrees)
-        #tract_number,patch_number = tract.tract_id,patch.getSequentialIndex()
-        tract_number,patch_number = int(source['tract']),int(source['patch'])
-
-        new_wcs,small_box = gen_wcsbox(position_container,point)
     
-        #fig,ax=plt.subplots(1,5,figsize=(30,8))
-    
+
+def cutout_over_patch(ll, inpatch, coadd_get, variance_required=False):
+    '''
+    Generate cutouts for each source in the given patch using the provided coadd images.
+
+    '''
+    for ii, src in inpatch.iterrows():
+        point = SkyCoord(ra=src['ra']*u.degree,dec=src['dec']*u.degree, frame='icrs')
+        filename = cutout_dir / f'cutout_{src["objid"]}.npy'
+
+        try: small_bbox = coadd_get['g'].bbox_from_sky_circle(point, box_size_deg*u.degree, clip=False)
+        except: continue
+
+        print(ii)
+
+        #fig,ax=plt.subplots(1,3,figsize=(30,8))
+
+        img_array = []
+        coadds = {}
         for jj,filt in enumerate(bands):
-            #coadd = butler.get(mapping[tract_number][0]) #Get the coadd from the data reference.
-            #cd_wcs = coadd.getWcs()  #Get the WCS from the coadd.
-       
-            #Create a new coadd image in the band defined above that is a combination of the inputs contained within the defined box. 
-            #Note that the run method modifies the bounding box in place, so a copy is made.
-            getTemplateTask = GetTemplateTask()
-            new_image = getTemplateTask.run(
-            coaddExposures={tract_number:[coadd_get[filt]]},
-            bbox=Box2I(small_box),wcs=new_wcs,
-            dataIds={tract_number:[did_get[filt]]},
-            physical_filter=filt,)
-        
-            fnm = '/home/' + username + '/lsst_science/cutouts/temp_{}{}.fits'.format(filt,ll)
-            afwDisplay.writeFitsImage(fnm,  new_image.template.maskedImage,  wcs=new_image.template.wcs)
-        
-            img_array = new_image.template.image.array
-            #m, s = np.mean(img_array), np.std(img_array)
-    
-            del img_array, fnm, new_image
-        reconstitute_fits(username,ra,dec,source['objid'],ll)
+            
+                try: coadds[filt] = coadd_get[filt][small_bbox] 
+                except: break
+
+                if variance_required: 
+                    img_array.append([coadds[filt].image.array,coadds[filt].variance.array])
+                else:
+                    img_array.append([coadds[filt].image.array])
+
+                #m, s = np.mean(img_array[jj][0]), np.std(img_array[jj][0])
+                #ax[jj].imshow(img_array[jj][0], interpolation='nearest', cmap=bands[filt], vmin=m-s, vmax=m+s, origin='lower')
+                #del m,s
         #plt.show()
 
-def run_cutouts(ll, up, sample, results, ):
- 
+        np.save(filename, np.array(img_array))
+        del coadds, img_array, small_bbox
+
+def loop_over_patches(ll, up, sample, patches_table, variance_required=False):
     # For each unique patch, retrieve the corresponding coadd data, and generate cutouts for each source in that patch.
 
-    inpatch = sample[sample['patch']==up]
-    print('inpatch shape:',inpatch.shape)
-    tp_link = results[(results['lsst_tract']==sample['tract'][0])&(results['lsst_patch']==up)]
-    s_ra, s_dec = (tp_link['s_ra'].values)[0], (tp_link['s_dec'].values)[0]
-    print(ll, s_ra, s_dec, 'patch number:',up)
+    inpatch = sample[(sample['tract']==up['tract'])&(sample['patch']==up['patch'])]
+      
+    tp_link = patches_table[(patches_table['lsst_tract']==up['tract'])&(patches_table['lsst_patch']==up['patch'])]
+    s_ra,s_dec = (tp_link['s_ra'].values)[0],(tp_link['s_dec'].values)[0]
+    print(ll, s_ra, s_dec, 'tract number:', up['tract'],'patch number:', up['patch'])
 
+    coadd_get = load_bigcoadd(s_ra, s_dec)
+    cutout_over_patch(ll, inpatch, coadd_get, variance_required=variance_required)
 
-    coadd_get, did_get, position_container = get_coadd_basics(s_ra, s_dec)
-    get_coadd_cutouts(ll, inpatch, coadd_get, did_get, position_container)
-
-    del inpatch, coadd_get, did_get, position_container
-
-    print(ll, 'Tract')
+    del inpatch, coadd_get, did_get, tp_link
     
 if __name__ == '__main__':
     """
@@ -211,27 +173,39 @@ if __name__ == '__main__':
     """
 
     # Load the sample of galaxies from a CSV file containing their coordinates and pre-determined patch and tract information.
-    sample = pd.read_csv('v1dp2.csv')
+    samplefile = 'v1sdwarf_list.csv'
+    sample = pd.read_csv(samplefile, dtype={'objid': str})
     #print('Shape of sample dataframe:',sample0.shape)
-
     #sample = sample0.sample(n=5000, random_state=5)
     #print(sample.shape)
 
-    # Query the TAP service to retrieve the necessary information about the relevant patches.
-    query = "SELECT lsst_tract,lsst_patch,s_ra,s_dec, s_region " \
-            "FROM dp1.CoaddPatches " 
-    results = service.search(query).to_table().to_pandas()
+     # Check if the patches_table.csv file exists; if not, query the TAP service to create it.
+    if os.path.exists('patches_table.csv'):
+            patches_table = pd.read_csv('patches_table.csv')
+    else:
+            patches_table = query_atlas()
+            patches_table.to_csv('patches_table.csv', index=False)
 
+    # Check if the 'patch' column exists in the sample dataframe; if not, compute the corresponding tract and patch for each galaxy using the skymap.
+    if 'patch' not in sample.columns: 
+        tp = match_tractpatch(sample[['ra','dec']]) 
+        sample['tract'],sample['patch'] = tp[:,0], tp[:,1]
+        sample.to_csv(samplefile, index=False)
+
+        del tp
+
+    existings = [re.search(r'\d+',f).group() for f in os.listdir(cutout_dir) if os.path.isfile(os.path.join(cutout_dir, f))]
+    sources = (sample[sample['objid'].isin(existings)].drop_duplicates(subset='objid', keep='first')).reset_index(drop=True)
+    print(len(existings), sources.shape)
+    
     # Select unique patches from the tract to avoid redundant processing.
-    unique_patch = sample['patch'].unique()
+    unique_patch = pd.concat([sources['patch'],sources['tract']]).unique()
+    print(unique_patch)
     print('No. of unique patches:',len(unique_patch))
 
     patch_input = [(ll,up) for ll,up in enumerate(unique_patch)]
-
-    run_wrapper = partial(run_cutouts, sample=sample, results=results)
+    run_wrapper = partial(loop_over_patch, sample=sources, patches_table=patches_table, variance_required=False)
 
     with multiprocessing.Pool(4) as pool:
 
         pool.starmap(run_wrapper, patch_input)
-
-

@@ -6,5 +6,4 @@
 
 # Whitelist your select files
 !lsst_coadd_bulkMP.py
-!map_tractpatch.ipynb
 !coadd_cutout.ipynb
