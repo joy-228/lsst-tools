@@ -211,11 +211,11 @@ if __name__ == '__main__':
     """
 
     # Load the sample of galaxies from a CSV file containing their coordinates and pre-determined patch and tract information.
-    sample0 = pd.read_csv('v1sdwarf_list.csv')
+    sample = pd.read_csv('v1dp2.csv')
     #print('Shape of sample dataframe:',sample0.shape)
 
-    sample = sample0.sample(n=5000, random_state=5)
-    print(sample.shape)
+    #sample = sample0.sample(n=5000, random_state=5)
+    #print(sample.shape)
 
     # Query the TAP service to retrieve the necessary information about the relevant patches.
     query = "SELECT lsst_tract,lsst_patch,s_ra,s_dec, s_region " \
@@ -234,15 +234,4 @@ if __name__ == '__main__':
 
         pool.starmap(run_wrapper, patch_input)
 
-# %%
-'''
-        SIGMA_TO_FWHM = 2.0*np.sqrt(2.0*np.log(2.0))
-    
-        center_pix_new = new_wcs.skyToPixel(point)
-        point_new = Point2D(center_pix_new)
-        newimage_psf = new_image.template.getPsf()
-        psf_sigma_new = newimage_psf.computeShape(point_new).getDeterminantRadius()
-    
-        print(f"newimage FWHM = {psf_sigma_new * SIGMA_TO_FWHM: .3f} pixels")
-        '''
 
