@@ -223,6 +223,5 @@ if __name__ == '__main__':
     # Use multiprocessing to process each patch in parallel, generating cutouts for all sources within each patch. The `loop_over_patches` function is called for each patch, and the results are saved as .npy files in the specified output directory.
     run_wrapper = partial(loop_over_patches, sample=sources,  variance_required=False)
 
-    with multiprocessing.Pool(2) as pool:
-
+with multiprocessing.Pool(processes=2, maxtasksperchild=1) as pool:
         pool.starmap(run_wrapper, patch_input)
